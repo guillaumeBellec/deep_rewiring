@@ -1,5 +1,5 @@
 # Introduction to Deep Rewiring in tensorflow
-This repository is meant to share two basic script to illustrate Deep Rewiring.
+This repository is meant to share two basic scripts to illustrate Deep Rewiring.
 Feel free to cite our paper if you use this code.
 
 "Deep Rewiring: Training very sparse deep networks"
