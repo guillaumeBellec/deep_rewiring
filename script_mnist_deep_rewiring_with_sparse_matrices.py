@@ -42,6 +42,7 @@ nb_non_zero_coeff_list = [int(n) for n in nb_non_zero_coeff_list]
 
 # Placeholders
 x = tf.placeholder(dtype, [None, n_pixels])
+xT = tf.transpose(x)
 y = tf.placeholder(dtype, [None, n_out])
 
 
@@ -56,89 +57,84 @@ def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
     :return:
     '''
     with tf.name_scope('SynapticSampler'):
-        w_0 = rd.randn(n_in,n_out) / np.sqrt(n_in) # initial weight values
+        w0_vals = rd.randn(nb_non_zero) / np.sqrt(n_in) # initial weight values
 
         # Gererate the random mask
-        is_con_0 = np.zeros((n_in,n_out),dtype=bool)
-        ind_in = rd.choice(np.arange(n_in),size=nb_non_zero)
-        ind_out = rd.choice(np.arange(n_out),size=nb_non_zero)
-        is_con_0[ind_in,ind_out] = True
+        ind_in = tf.random_uniform(shape=[nb_non_zero],maxval=n_in,dtype=tf.int64)
+        ind_out = tf.random_uniform(shape=[nb_non_zero],maxval=n_out,dtype=tf.int64)
+        indices = tf.stack([ind_out,ind_in],axis=1)
+        indices = tf.Variable(initial_value=indices,trainable=False,dtype=tf.int64)
 
         # Generate random signs
-        sign_0 = np.sign(rd.randn(n_in,n_out))
+        sign_0 = np.sign(rd.randn(nb_non_zero))
 
         # Define the tensorflow matrices
-        th = tf.Variable(np.abs(w_0) * is_con_0, dtype=dtype, name='theta')
+        th = tf.Variable(np.abs(w0_vals), dtype=dtype, name='theta')
         w_sign = tf.Variable(sign_0, dtype=dtype, trainable=False, name='sign')
-        is_connected = tf.greater(th,0, name='mask')
-        w = tf.where(condition=is_connected, x=w_sign * th, y=tf.zeros((n_in, n_out), dtype=dtype), name='weight')
+        w = tf.SparseTensor(indices=indices,values=th * w_sign, dense_shape=[n_out,n_in])
+        w = tf.sparse_reorder(w)
 
-        return w,w_sign,th,is_connected
+        return w,w_sign,indices,th
 
-def assert_connection_number(theta, targeted_number):
-    '''
-    Function to check during the tensorflow simulation if the number of connection in well defined after each simulation.
-    :param theta:
-    :param targeted_number:
-    :return:
-    '''
-    th = theta.read_value()
-    is_con = tf.greater(th, 0)
-
-    nb_is_con = tf.reduce_sum(tf.cast(is_con, tf.int32))
-    assert_is_con = tf.Assert(tf.equal(nb_is_con, targeted_number), data=[nb_is_con, targeted_number],
-                              name='NumberOfConnectionCheck')
-    return assert_is_con
-
-def rewiring(theta, target_nb_connection, epsilon=1e-12):
+def rewiring(theta, sign, indices,w):
     '''
     The rewiring operation to use after each iteration.
     :param theta:
     :param target_nb_connection:
     :return:
+
     '''
 
     with tf.name_scope('rewiring'):
         th = theta.read_value()
-        is_con = tf.greater(th, 0)
+        n_in,n_out = w.get_shape()
+        target_nb_connection = tf.size(theta)
 
-        n_connected = tf.reduce_sum(tf.cast(is_con, tf.int32))
-        nb_reconnect = target_nb_connection - n_connected
-        nb_reconnect = tf.maximum(nb_reconnect,0)
+        #
+        reconnect_mask = tf.less_equal(th,0)
 
-        reconnect_candidate_coord = tf.where(tf.logical_not(is_con), name='CandidateCoord')
+        # Gererate the random mask
+        ind_in = tf.random_uniform(shape=[target_nb_connection],maxval=n_in,dtype=tf.int64)
+        ind_out = tf.random_uniform(shape=[target_nb_connection],maxval=n_out,dtype=tf.int64)
+        new_indices = tf.stack([ind_in,ind_out],axis=1)
+        new_indices = tf.where(reconnect_mask,new_indices,indices)
+        set_indices = tf.assign(indices,new_indices)
 
-        n_candidates = tf.shape(reconnect_candidate_coord)[0]
-        reconnect_sample_id = tf.random_shuffle(tf.range(n_candidates))[:nb_reconnect]
-        reconnect_sample_coord = tf.gather(reconnect_candidate_coord, reconnect_sample_id, name='SelectedCoord')
+        # Generate random signs
+        new_sign = tf.random_uniform(shape=[target_nb_connection],maxval=2,dtype=tf.int32) * 2 -1
+        new_sign = tf.cast(new_sign,dtype=tf.float32)
+        new_sign = tf.where(reconnect_mask, new_sign, sign)
+        set_sign = tf.assign(sign, new_sign)
 
-        # Apply the rewiring
-        reconnect_vals = tf.fill(dims=[nb_reconnect], value=epsilon, name='InitValues')
-        reconnect_op = tf.scatter_nd_update(theta, reconnect_sample_coord, reconnect_vals, name='Reconnect')
+        #new_th = tf.zeros(shape=[target_nb_connection],dtype=tf.float32)
+        new_th = tf.random_normal(shape=[target_nb_connection],dtype=tf.float32,stddev=0)
+        new_th = tf.where(reconnect_mask,new_th,th)
+        set_th = tf.assign(theta,new_th)
 
-        with tf.control_dependencies([reconnect_op]):
-            connection_check = assert_connection_number(theta=theta, targeted_number=target_nb_connection)
-            with tf.control_dependencies([connection_check]):
+        #
+        with tf.control_dependencies([set_indices,set_sign,set_th]):
                 return tf.no_op('Rewiring')
-
 
 # Define the computational graph
 with tf.name_scope('Layer1'):
-    W_1, _, th_1, _ = weight_sampler_strict_number(n_pixels, n_1, nb_non_zero_coeff_list[0])
-    a_1 = tf.matmul(x, W_1)
+    W_1, w_sign_1, w_indices_1, th_1 = weight_sampler_strict_number(n_pixels, n_1, nb_non_zero_coeff_list[0])
+    a_1 = tf.sparse_tensor_dense_matmul(W_1, xT)
     z_1 = tf.nn.relu(a_1)
 
 with tf.name_scope('Layer2'):
-    W_2, _, th_2, _ = weight_sampler_strict_number(n_1, n_2, nb_non_zero_coeff_list[1])
-    a_2 = tf.matmul(z_1, W_2)
+    W_2, w_sign_2, w_indices_2, th_2 = weight_sampler_strict_number(n_1, n_2, nb_non_zero_coeff_list[1])
+    a_2 = tf.sparse_tensor_dense_matmul(W_2, z_1)
     z_2 = tf.nn.relu(a_2)
 
 with tf.name_scope('OutLayer'):
-    w_out, _, th_out, _ = weight_sampler_strict_number(n_2, n_out, nb_non_zero_coeff_list[2])
-    logits_predict = tf.matmul(z_2, w_out)
+    w_out, w_sign_out, w_indices_out, th_out = weight_sampler_strict_number(n_2, n_out, nb_non_zero_coeff_list[2])
+    logits_predict = tf.sparse_tensor_dense_matmul(w_out, z_2)
+    logits_predict = tf.transpose(logits_predict)
 
 # Make list of weight for convenience
 theta_list = [th_1, th_2, th_out]
+sign_list = [w_sign_1, w_sign_2, w_sign_out]
+index_list = [w_indices_1, w_indices_2, w_indices_out]
 weight_list = [W_1, W_2, w_out]
 
 with tf.name_scope('Loss'):
@@ -155,19 +151,23 @@ with tf.name_scope('Training'):
 
     add_gradient_op_list = [tf.assign_add(th, lr * mask_connected(th) * noise_update(th)) for th in theta_list]
     apply_l1_reg = [tf.assign_add(th, - lr * mask_connected(th) * FLAGS.l1) for th in theta_list]
-    asserts = [assert_connection_number(th,nb) for th,nb in zip(theta_list,nb_non_zero_coeff_list)]
 
     with tf.control_dependencies([apply_gradients] + add_gradient_op_list + apply_l1_reg):
-        rewire_list = [rewiring(theta, nb) for theta, nb in zip(theta_list, nb_non_zero_coeff_list)]
+        rewire_list = [rewiring(theta, sign, indices, w) for theta, sign, indices, w in
+                       zip(theta_list, sign_list, index_list, weight_list)]
         with tf.control_dependencies(rewire_list):
             train_step = tf.no_op('Train')
 
 # Some statistics for monitoring the simulation
 with tf.name_scope('Stats'):
-    nb_zeros = [tf.reduce_sum(tf.cast(tf.equal(w, 0), dtype)) for w in weight_list]
-    sizes = [tf.cast(tf.size(w), dtype=dtype) for w in weight_list]
-    layer_connectivity = [tf.cast(1, dtype=dtype) - nb_z / size for w, nb_z, size in zip(weight_list, nb_zeros, sizes)]
-    global_connectivity = tf.cast(1, dtype=dtype) - tf.reduce_sum(nb_zeros) / tf.reduce_sum(sizes)
+    get_size_sp = lambda w: int(w.get_shape()[0]) * int(w.get_shape()[1])
+    get_non_zeros_sp = lambda w: tf.reduce_sum(tf.cast(tf.not_equal(w.values,0),dtype=tf.int32))
+
+    nb_entries = [get_non_zeros_sp(w) for w in weight_list]
+    sizes = [get_size_sp(w) for w in weight_list]
+
+    layer_connectivity = [get_non_zeros_sp(w) / get_size_sp(w) for w in weight_list]
+    global_connectivity = tf.reduce_sum(nb_entries) / tf.reduce_sum(sizes)
 
 #
 sess = tf.Session()
@@ -187,6 +187,7 @@ results = {
 
 turnover = [0,0,0]
 training_time = 0
+testing_time = 0
 acc, loss = sess.run([accuracy, cross_entropy], feed_dict={x: mnist.test.images, y: mnist.test.labels})
 for k in range(n_iter):
 
