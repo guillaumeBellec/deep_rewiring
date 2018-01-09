@@ -42,9 +42,7 @@ nb_non_zero_coeff_list = [int(n) for n in nb_non_zero_coeff_list]
 
 # Placeholders
 x = tf.placeholder(dtype, [None, n_pixels])
-xT = tf.transpose(x)
 y = tf.placeholder(dtype, [None, n_out])
-
 
 def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
     '''
@@ -62,7 +60,7 @@ def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
         # Gererate the random mask
         ind_in = tf.random_uniform(shape=[nb_non_zero],maxval=n_in,dtype=tf.int64)
         ind_out = tf.random_uniform(shape=[nb_non_zero],maxval=n_out,dtype=tf.int64)
-        indices = tf.stack([ind_out,ind_in],axis=1)
+        indices = tf.stack([ind_in,ind_out],axis=1)
         indices = tf.Variable(initial_value=indices,trainable=False,dtype=tf.int64)
 
         # Generate random signs
@@ -71,7 +69,7 @@ def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
         # Define the tensorflow matrices
         th = tf.Variable(np.abs(w0_vals), dtype=dtype, name='theta')
         w_sign = tf.Variable(sign_0, dtype=dtype, trainable=False, name='sign')
-        w = tf.SparseTensor(indices=indices,values=th * w_sign, dense_shape=[n_out,n_in])
+        w = tf.SparseTensor(indices=indices,values=th * w_sign, dense_shape=[n_in,n_out])
         w = tf.sparse_reorder(w)
 
         return w,w_sign,indices,th
@@ -113,22 +111,22 @@ def rewiring(theta, sign, indices,w):
 
         #
         with tf.control_dependencies([set_indices,set_sign,set_th]):
-                return tf.no_op('Rewiring')
+            return tf.no_op('Rewiring')
 
 # Define the computational graph
 with tf.name_scope('Layer1'):
     W_1, w_sign_1, w_indices_1, th_1 = weight_sampler_strict_number(n_pixels, n_1, nb_non_zero_coeff_list[0])
-    a_1 = tf.sparse_tensor_dense_matmul(W_1, xT)
+    a_1 = tf.sparse_tensor_dense_matmul(W_1, x, adjoint_a=True,adjoint_b=True)
     z_1 = tf.nn.relu(a_1)
 
 with tf.name_scope('Layer2'):
     W_2, w_sign_2, w_indices_2, th_2 = weight_sampler_strict_number(n_1, n_2, nb_non_zero_coeff_list[1])
-    a_2 = tf.sparse_tensor_dense_matmul(W_2, z_1)
+    a_2 = tf.sparse_tensor_dense_matmul(W_2, z_1, adjoint_a=True,adjoint_b=False)
     z_2 = tf.nn.relu(a_2)
 
 with tf.name_scope('OutLayer'):
     w_out, w_sign_out, w_indices_out, th_out = weight_sampler_strict_number(n_2, n_out, nb_non_zero_coeff_list[2])
-    logits_predict = tf.sparse_tensor_dense_matmul(w_out, z_2)
+    logits_predict = tf.sparse_tensor_dense_matmul(w_out, z_2, adjoint_a=True,adjoint_b=False)
     logits_predict = tf.transpose(logits_predict)
 
 # Make list of weight for convenience
