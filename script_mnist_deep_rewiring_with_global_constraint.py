@@ -34,8 +34,8 @@ n_iter = FLAGS.n_epochs * n_image_per_epoch // FLAGS.batch
 
 print_every = FLAGS.print_every
 n_minibatch = FLAGS.batch
-lr = tf.Variable(FLAGS.lr,trainable=False,dtype=tf.float32)
-decay_lr_op = tf.assign(lr,lr * FLAGS.lr_epoch_decay)
+lr = tf.Variable(FLAGS.lr, trainable=False, dtype=tf.float32)
+decay_lr_op = tf.assign(lr, lr * FLAGS.lr_epoch_decay)
 
 # Define the number of neurons per layer
 sparsity_list = [FLAGS.p01, FLAGS.p02, FLAGS.p0out]
@@ -45,6 +45,42 @@ nb_non_zero_coeff_list = [int(n) for n in nb_non_zero_coeff_list]
 # Placeholders
 x = tf.placeholder(dtype, [None, n_pixels])
 y = tf.placeholder(dtype, [None, n_out])
+
+
+def sample_matrix_specific_reconnection_number_for_global_fixed_connectivity(theta_list, ps, upper_bound_check=False):
+    with tf.name_scope('NBreconnectGenerator'):
+        theta_vals = [theta.read_value() for theta in theta_list]
+
+        # Compute size and probability of connections
+        nb_possible_connections_list = [tf.cast(tf.size(th), dtype=tf.float32) * p for th, p in zip(theta_list, ps)]
+        total_possible_connections = tf.reduce_sum(nb_possible_connections_list)
+        max_total_connections = tf.cast(total_possible_connections, dtype=tf.int32)
+        sampling_probs = [nb_possible_connections / total_possible_connections \
+                          for nb_possible_connections in nb_possible_connections_list]
+
+        def nb_connected(theta_val):
+            is_con = tf.greater(theta_val, 0)
+            n_connected = tf.reduce_sum(tf.cast(is_con, tf.int32))
+            return n_connected
+
+        total_connected = tf.reduce_sum([nb_connected(theta) for theta in theta_vals])
+
+        if upper_bound_check:
+            assert_upper_bound_check = tf.Assert(tf.less_equal(total_connected, max_total_connections),
+                                                 data=[max_total_connections, total_connected],
+                                                 name='RewiringUpperBoundCheck')
+        else:
+            assert_upper_bound_check = tf.Assert(True,
+                                                 data=[max_total_connections, total_connected],
+                                                 name='SkippedRewiringUpperBoundCheck')
+
+        with tf.control_dependencies([assert_upper_bound_check]):
+            nb_reconnect = tf.maximum(0, max_total_connections - total_connected)
+
+            sample_split = tf.distributions.Categorical(probs=sampling_probs).sample(nb_reconnect)
+            is_class_i_list = [tf.equal(sample_split, i) for i in range(len(theta_list))]
+            counts = [tf.reduce_sum(tf.cast(is_class_i, dtype=tf.int32)) for is_class_i in is_class_i_list]
+            return counts
 
 
 def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
@@ -58,24 +94,25 @@ def weight_sampler_strict_number(n_in, n_out, nb_non_zero, dtype=tf.float32):
     :return:
     '''
     with tf.name_scope('SynapticSampler'):
-        w_0 = rd.randn(n_in,n_out) / np.sqrt(n_in) # initial weight values
+        w_0 = rd.randn(n_in, n_out) / np.sqrt(n_in)  # initial weight values
 
         # Gererate the random mask
-        is_con_0 = np.zeros((n_in,n_out),dtype=bool)
-        ind_in = rd.choice(np.arange(n_in),size=nb_non_zero)
-        ind_out = rd.choice(np.arange(n_out),size=nb_non_zero)
-        is_con_0[ind_in,ind_out] = True
+        is_con_0 = np.zeros((n_in, n_out), dtype=bool)
+        ind_in = rd.choice(np.arange(n_in), size=nb_non_zero)
+        ind_out = rd.choice(np.arange(n_out), size=nb_non_zero)
+        is_con_0[ind_in, ind_out] = True
 
         # Generate random signs
-        sign_0 = np.sign(rd.randn(n_in,n_out))
+        sign_0 = np.sign(rd.randn(n_in, n_out))
 
         # Define the tensorflow matrices
         th = tf.Variable(np.abs(w_0) * is_con_0, dtype=dtype, name='theta')
         w_sign = tf.Variable(sign_0, dtype=dtype, trainable=False, name='sign')
-        is_connected = tf.greater(th,0, name='mask')
+        is_connected = tf.greater(th, 0, name='mask')
         w = tf.where(condition=is_connected, x=w_sign * th, y=tf.zeros((n_in, n_out), dtype=dtype), name='weight')
 
-        return w,w_sign,th,is_connected
+        return w, w_sign, th, is_connected
+
 
 def assert_connection_number(theta, targeted_number):
     '''
@@ -92,7 +129,8 @@ def assert_connection_number(theta, targeted_number):
                               name='NumberOfConnectionCheck')
     return assert_is_con
 
-def rewiring(theta, target_nb_connection, epsilon=1e-12):
+
+def rewiring(theta, nb_reconnect, epsilon=1e-12):
     '''
     The rewiring operation to use after each iteration.
     :param theta:
@@ -104,9 +142,7 @@ def rewiring(theta, target_nb_connection, epsilon=1e-12):
         th = theta.read_value()
         is_con = tf.greater(th, 0)
 
-        n_connected = tf.reduce_sum(tf.cast(is_con, tf.int32))
-        nb_reconnect = target_nb_connection - n_connected
-        nb_reconnect = tf.maximum(nb_reconnect,0)
+        nb_reconnect = tf.maximum(nb_reconnect, 0)
 
         reconnect_candidate_coord = tf.where(tf.logical_not(is_con), name='CandidateCoord')
 
@@ -119,9 +155,7 @@ def rewiring(theta, target_nb_connection, epsilon=1e-12):
         reconnect_op = tf.scatter_nd_update(theta, reconnect_sample_coord, reconnect_vals, name='Reconnect')
 
         with tf.control_dependencies([reconnect_op]):
-            connection_check = assert_connection_number(theta=theta, targeted_number=target_nb_connection)
-            with tf.control_dependencies([connection_check]):
-                return tf.no_op('Rewiring')
+            return tf.no_op('Rewiring')
 
 
 # Define the computational graph
@@ -157,11 +191,14 @@ with tf.name_scope('Training'):
 
     add_gradient_op_list = [tf.assign_add(th, lr * mask_connected(th) * noise_update(th)) for th in theta_list]
     apply_l1_reg = [tf.assign_add(th, - lr * mask_connected(th) * FLAGS.l1) for th in theta_list]
-    asserts = [assert_connection_number(th,nb) for th,nb in zip(theta_list,nb_non_zero_coeff_list)]
+    asserts = [assert_connection_number(th, nb) for th, nb in zip(theta_list, nb_non_zero_coeff_list)]
 
     with tf.control_dependencies([apply_gradients] + add_gradient_op_list + apply_l1_reg):
-        rewire_list = [rewiring(theta, nb) for theta, nb in zip(theta_list, nb_non_zero_coeff_list)]
-        with tf.control_dependencies(rewire_list):
+        number_of_rewired_connections = sample_matrix_specific_reconnection_number_for_global_fixed_connectivity(
+            theta_list, [FLAGS.p01, FLAGS.p02, FLAGS.p0out])
+
+        apply_rewiring = [rewiring(th, nb_reconnect=nb) for th, nb in zip(theta_list, number_of_rewired_connections)]
+        with tf.control_dependencies(apply_rewiring):
             train_step = tf.no_op('Train')
 
 # Some statistics for monitoring the simulation
@@ -186,13 +223,12 @@ results = {
     'turnover_list': [],
     'training_time_list': []}
 
-
-turnover = [0,0,0]
+turnover = [0, 0, 0]
 training_time = 0
 acc, loss = sess.run([accuracy, cross_entropy], feed_dict={x: mnist.test.images, y: mnist.test.labels})
 last_epoch = 0
 for k in range(n_iter):
-    if last_epoch+1 == mnist.train.epochs_completed:
+    if last_epoch + 1 == mnist.train.epochs_completed:
         sess.run(decay_lr_op)
         last_epoch = mnist.train.epochs_completed
         print('Learning rate decayed: {:.2g}'.format(sess.run(lr)))
@@ -205,8 +241,10 @@ for k in range(n_iter):
         acc, loss = sess.run([accuracy, cross_entropy], feed_dict={x: mnist.test.images, y: mnist.test.labels})
         testing_time = time.time() - t0
 
-        print('Epoch: {} \t time/it: {:.3g} s \t time/test: {:.3g} s  \t it: {} \t acc: {:.3g} \t loss {:.3g} \t sparsity: {:.3g} \t layer wise:'.format(
-                mnist.train.epochs_completed, training_time, testing_time, k, acc, loss, global_connectivity_numpy) + np.array_str(
+        print(
+            'Epoch: {} \t time/it: {:.3g} s \t time/test: {:.3g} s  \t it: {} \t acc: {:.3g} \t loss {:.3g} \t sparsity: {:.3g} \t layer wise:'.format(
+                mnist.train.epochs_completed, training_time, testing_time, k, acc, loss,
+                global_connectivity_numpy) + np.array_str(
                 np.array(layer_connectivity_numpy), precision=2))
 
     for key, variable in zip(
@@ -234,7 +272,7 @@ for k in range(n_iter):
         turnover = creation_nbs
         print('Syn created: {} {} {}'.format(creation_nbs[0], creation_nbs[1], creation_nbs[2]))
         print('Syn deleted: {} {} {}'.format(deletion_nbs[0], deletion_nbs[1], deletion_nbs[2]))
-        print('Syn connected: {} {} {}'.format(n_cons[0], n_cons[1], n_cons[2]))
+        print('Syn connected: {} {} {} (total: {})'.format(n_cons[0], n_cons[1], n_cons[2], n_cons[0] + n_cons[1] + n_cons[2]))
 
 # add weight matrix
 weights_storage = {'weight_list': sess.run(weight_list),
